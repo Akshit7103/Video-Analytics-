@@ -1,0 +1,8 @@
+insightface
+opencv-python
+streamlit
+pandas
+sqlalchemy
+pillow
+torch
+plotly
