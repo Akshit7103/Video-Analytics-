@@ -23,6 +23,31 @@ os.makedirs(EMBEDDINGS_DIR, exist_ok=True)
 st.set_page_config(page_title='Face Recognition Dashboard', layout='wide')
 st.title('🧠 Face Recognition & Logging Dashboard')
 
+# --- Cached model initialization ---
+@st.cache_resource
+def load_face_analysis_model():
+    """Load and cache the InsightFace model for reuse"""
+    app = FaceAnalysis()
+    app.prepare(ctx_id=0, det_size=(224, 224))  # Further reduced for maximum speed
+    return app
+
+@st.cache_data(ttl=60)  # Cache for 60 seconds
+def load_face_embeddings():
+    """Load and cache face embeddings for faster lookup"""
+    known_embeddings = []
+    known_names = []
+    known_roles = []
+    for file in os.listdir(EMBEDDINGS_DIR):
+        if file.endswith('.npy'):
+            embedding = np.load(os.path.join(EMBEDDINGS_DIR, file))
+            name_role = os.path.splitext(file)[0]
+            if '_' in name_role:
+                name, role = name_role.rsplit('_', 1)
+                known_names.append(name.replace('_', ' ').title())
+                known_roles.append(role)
+                known_embeddings.append(embedding)
+    return known_embeddings, known_names, known_roles
+
 # --- Helper functions ---
 def get_db_logs():
     conn = sqlite3.connect(DB_PATH)
@@ -234,7 +259,7 @@ def create_person_activity_chart(df):
     return fig
 
 # --- Sidebar Navigation ---
-page = st.sidebar.radio('Go to', ['Register Face', 'Edit Faces', 'Real-Time Recognition', 'Analytics & Reports', 'View Logs & Faces'])
+page = st.sidebar.radio('Go to', ['Register Face', 'Edit Faces', 'Real-Time Recognition', 'Video Upload & Analysis', 'Analytics & Reports', 'View Logs & Faces'])
 
 # --- Register Face ---
 if page == 'Register Face':
@@ -451,37 +476,78 @@ elif page == 'Real-Time Recognition':
     st.header('🎥 Real-Time Recognition')
     if 'recognizing' not in st.session_state:
         st.session_state['recognizing'] = False
+    if 'stream_url' not in st.session_state:
+        st.session_state['stream_url'] = "http://192.168.1.29:4747/video"
 
     if not st.session_state['recognizing']:
-        if st.button('Start Webcam Recognition'):
-            st.session_state['recognizing'] = True
+        st.subheader('📹 Video Source Configuration')
+        
+        # Video source selection
+        video_source = st.radio(
+            "Select video source:",
+            ["Webcam (Default)", "IP Camera/Stream URL"],
+            horizontal=True
+        )
+        
+        if video_source == "Webcam (Default)":
+            selected_source = 0
+            st.info("Using default webcam (camera index 0)")
+        else:
+            # Stream URL input
+            stream_url = st.text_input(
+                "Enter stream URL:",
+                value=st.session_state['stream_url'],
+                placeholder="http://192.168.1.29:4747/video",
+                help="Enter the full URL for your IP camera or stream (e.g., DroidCam, RTSP, HTTP stream)"
+            )
+            st.session_state['stream_url'] = stream_url
+            selected_source = stream_url
+            
+            # Show some common examples
+            with st.expander("📋 Common Stream URL Examples"):
+                st.code("DroidCam: http://192.168.1.XX:4747/video")
+                st.code("RTSP Camera: rtsp://username:password@192.168.1.XX:554/stream")
+                st.code("HTTP Stream: http://192.168.1.XX:8080/stream")
+                st.code("YouTube Live: https://www.youtube.com/watch?v=VIDEO_ID")
+        
+        if st.button('🚀 Start Recognition', type='primary'):
+            if video_source == "IP Camera/Stream URL" and not stream_url.strip():
+                st.error("Please enter a valid stream URL")
+            else:
+                st.session_state['recognizing'] = True
+                st.session_state['selected_source'] = selected_source
+                st.rerun()
 
     if st.session_state['recognizing']:
-        stop = st.button('Stop Recognition', key='unique_stop_btn')
+        stop = st.button('⏹️ Stop Recognition', key='unique_stop_btn', type='secondary')
         stframe = st.empty()
-        # Load embeddings
-        known_embeddings = []
-        known_names = []
-        known_roles = []
-        for file in os.listdir(EMBEDDINGS_DIR):
-            if file.endswith('.npy'):
-                embedding = np.load(os.path.join(EMBEDDINGS_DIR, file))
-                name_role = os.path.splitext(file)[0]
-                if '_' in name_role:
-                    name, role = name_role.rsplit('_', 1)
-                    known_names.append(name.replace('_', ' ').title())
-                    known_roles.append(role)
-                    known_embeddings.append(embedding)
-        app = FaceAnalysis()
-        app.prepare(ctx_id=0, det_size=(640, 640))
-        # Use DroidCam IP stream as video source
-        # Change the IP address and port here for your device
-        cap = cv2.VideoCapture("http://100.118.242.26:4747/video")
+        
+        # Display current video source
+        source_info = st.empty()
+        if st.session_state['selected_source'] == 0:
+            source_info.info("📹 Using: Default Webcam")
+        else:
+            source_info.info(f"📹 Using: {st.session_state['selected_source']}")
+        
+        # Use cached model and embeddings
+        app = load_face_analysis_model()
+        known_embeddings, known_names, known_roles = load_face_embeddings()
+        
+        # Use the selected video source
+        cap = cv2.VideoCapture(st.session_state['selected_source'])
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         frame_count = 0
         last_seen = {}
         LOG_INTERVAL = 10
+        SKIP_FRAMES = 8  # Further increased frame skipping for maximum performance
+        
+        # Batch database operations
+        pending_logs = []
+        last_batch_time = time.time()
+        BATCH_SIZE = 5
+        BATCH_INTERVAL = 3  # seconds
+        
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute('''CREATE TABLE IF NOT EXISTS logs (
@@ -492,42 +558,338 @@ elif page == 'Real-Time Recognition':
             event TEXT
         )''')
         conn.commit()
+        # Performance monitoring
+        processing_times = []
+        fps_counter = 0
+        fps_start_time = time.time()
+        
         try:
             while st.session_state['recognizing']:
+                frame_start_time = time.time()
                 ret, frame = cap.read()
                 frame_count += 1
-                if frame_count % 3 != 0:
-                    stframe.image(frame, channels='BGR')  # Show skipped frames for smooth preview
+                
+                # FPS calculation
+                fps_counter += 1
+                if fps_counter % 30 == 0:  # Update every 30 frames
+                    fps = fps_counter / (time.time() - fps_start_time)
+                    st.sidebar.metric("Live FPS", f"{fps:.1f}")
+                    fps_counter = 0
+                    fps_start_time = time.time()
+                
+                if frame_count % SKIP_FRAMES != 0:
                     if stop:
                         st.session_state['recognizing'] = False
                         break
                     continue  # Skip this frame for processing
+                
+                process_start = time.time()
                 faces = app.get(frame)
                 for face in faces:
                     embedding = face.normed_embedding
-                    dists = np.linalg.norm(np.array(known_embeddings) - embedding, axis=1)
-                    min_idx = np.argmin(dists) if len(dists) > 0 else -1
-                    if len(dists) > 0 and dists[min_idx] < 0.8:
+                    # Optimized distance calculation with early exit
+                    min_dist = float('inf')
+                    min_idx = -1
+                    for i, known_emb in enumerate(known_embeddings):
+                        dist = np.linalg.norm(known_emb - embedding)
+                        if dist < min_dist:
+                            min_dist = dist
+                            min_idx = i
+                            # Early exit if we find a very good match
+                            if dist < 0.3:
+                                break
+                    
+                    if min_idx != -1 and min_dist < 0.8:
                         name = known_names[min_idx]
                         role = known_roles[min_idx]
                         now = time.time()
                         if name not in last_seen or now - last_seen[name] > LOG_INTERVAL:
                             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                            c.execute('INSERT INTO logs (timestamp, name, role, event) VALUES (?, ?, ?, ?)',
-                                      (timestamp, name, role, 'present'))
-                            conn.commit()
+                            # Add to batch instead of immediate DB write
+                            pending_logs.append((timestamp, name, role, 'present'))
                             last_seen[name] = now
                         bbox = face.bbox.astype(int)
                         cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), (0,255,0), 2)
                         cv2.putText(frame, f'{name} ({role})', (bbox[0], bbox[1]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
+                
+                # Track processing time
+                processing_time = time.time() - process_start
+                processing_times.append(processing_time)
+                if len(processing_times) > 10:  # Keep last 10 measurements
+                    processing_times.pop(0)
+                
+                # Show processing stats in sidebar
+                if len(processing_times) > 0:
+                    avg_processing = sum(processing_times) / len(processing_times)
+                    st.sidebar.metric("Avg Processing Time", f"{avg_processing*1000:.1f}ms")
+                
+                # Batch database operations
+                current_time = time.time()
+                if (len(pending_logs) >= BATCH_SIZE or 
+                    current_time - last_batch_time > BATCH_INTERVAL) and pending_logs:
+                    try:
+                        c.executemany('INSERT INTO logs (timestamp, name, role, event) VALUES (?, ?, ?, ?)', 
+                                    pending_logs)
+                        conn.commit()
+                        pending_logs.clear()
+                        last_batch_time = current_time
+                    except Exception as e:
+                        st.error(f'Database error: {e}')
+                
                 stframe.image(frame, channels='BGR')
                 if stop:
                     st.session_state['recognizing'] = False
                     break
         finally:
+            # Flush any remaining logs
+            if pending_logs:
+                try:
+                    c.executemany('INSERT INTO logs (timestamp, name, role, event) VALUES (?, ?, ?, ?)', 
+                                pending_logs)
+                    conn.commit()
+                except Exception as e:
+                    st.error(f'Final database flush error: {e}')
             cap.release()
             conn.close()
             cv2.destroyAllWindows()
+
+# --- Video Upload & Analysis ---
+elif page == 'Video Upload & Analysis':
+    st.header('📹 Video Upload & Analysis')
+    
+    # File upload section
+    st.subheader('📤 Upload Video File')
+    uploaded_file = st.file_uploader(
+        "Choose a video file", 
+        type=['mp4', 'avi', 'mov', 'mkv'],
+        help="Supported formats: MP4, AVI, MOV, MKV (Max size: 200MB)"
+    )
+    
+    if uploaded_file is not None:
+        # Display file info
+        file_size = len(uploaded_file.getvalue()) / (1024 * 1024)  # Size in MB
+        st.info(f"📁 **File Info:** {uploaded_file.name} ({file_size:.2f} MB)")
+        
+        # Check file size
+        if file_size > 200:
+            st.error("❌ File size exceeds 200MB limit. Please upload a smaller file.")
+        else:
+            # Analysis button
+            if st.button('🔍 Start Video Analysis', type='primary'):
+                with st.spinner('🔄 Analyzing video... This may take a while depending on video length.'):
+                    # Save uploaded file temporarily
+                    with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp_file:
+                        tmp_file.write(uploaded_file.getvalue())
+                        temp_video_path = tmp_file.name
+                    
+                    try:
+                        # Load known faces
+                        known_embeddings = []
+                        known_names = []
+                        known_roles = []
+                        
+                        for file in os.listdir(EMBEDDINGS_DIR):
+                            if file.endswith('.npy'):
+                                embedding = np.load(os.path.join(EMBEDDINGS_DIR, file))
+                                name_role = os.path.splitext(file)[0]
+                                if '_' in name_role:
+                                    name, role = name_role.rsplit('_', 1)
+                                    known_names.append(name.replace('_', ' ').title())
+                                    known_roles.append(role)
+                                    known_embeddings.append(embedding)
+                        
+                        # Initialize face analysis
+                        app = FaceAnalysis()
+                        app.prepare(ctx_id=0, det_size=(640, 640))
+                        
+                        # Open video file
+                        cap = cv2.VideoCapture(temp_video_path)
+                        if not cap.isOpened():
+                            st.error("❌ Error: Could not open video file.")
+                        else:
+                            # Get video properties
+                            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                            fps = cap.get(cv2.CAP_PROP_FPS)
+                            duration = total_frames / fps if fps > 0 else 0
+                            
+                            # Analysis variables
+                            frame_count = 0
+                            detection_count = 0
+                            detections = []
+                            person_detections = {}
+                            
+                            # Progress bar
+                            progress_bar = st.progress(0)
+                            status_text = st.empty()
+                            
+                            # Process video frames
+                            while True:
+                                ret, frame = cap.read()
+                                if not ret:
+                                    break
+                                
+                                frame_count += 1
+                                
+                                # Update progress
+                                if total_frames > 0:
+                                    progress = frame_count / total_frames
+                                    progress_bar.progress(progress)
+                                    status_text.text(f"Processing frame {frame_count}/{total_frames} ({progress*100:.1f}%)")
+                                
+                                # Process every 5th frame for efficiency
+                                if frame_count % 5 != 0:
+                                    continue
+                                
+                                # Detect faces in frame
+                                faces = app.get(frame)
+                                
+                                for face in faces:
+                                    embedding = face.normed_embedding
+                                    dists = np.linalg.norm(np.array(known_embeddings) - embedding, axis=1)
+                                    min_idx = np.argmin(dists) if len(dists) > 0 else -1
+                                    
+                                    if len(dists) > 0 and dists[min_idx] < 0.8:
+                                        name = known_names[min_idx]
+                                        role = known_roles[min_idx]
+                                        detection_count += 1
+                                        
+                                        # Track detections per person
+                                        if name not in person_detections:
+                                            person_detections[name] = {
+                                                'count': 0,
+                                                'role': role,
+                                                'first_seen': frame_count / fps,
+                                                'last_seen': frame_count / fps
+                                            }
+                                        
+                                        person_detections[name]['count'] += 1
+                                        person_detections[name]['last_seen'] = frame_count / fps
+                                        
+                                        # Add to detections list
+                                        detections.append({
+                                            'frame': frame_count,
+                                            'timestamp': frame_count / fps,
+                                            'name': name,
+                                            'role': role
+                                        })
+                            
+                            cap.release()
+                        
+                        # Clean up temporary file
+                        os.unlink(temp_video_path)
+                        
+                        # Only show results if video was processed successfully
+                        if 'detection_count' in locals():
+                            # Display results
+                            st.success(f"✅ Analysis complete! Found {detection_count} detections.")
+                            
+                            # Results section
+                            st.subheader('📊 Analysis Results')
+                            
+                            # Summary metrics
+                            col1, col2, col3, col4 = st.columns(4)
+                            
+                            with col1:
+                                st.metric('Total Frames', total_frames)
+                            
+                            with col2:
+                                st.metric('Video Duration', f"{duration:.1f}s")
+                            
+                            with col3:
+                                st.metric('Total Detections', detection_count)
+                            
+                            with col4:
+                                st.metric('Unique Persons', len(person_detections))
+                            
+                            # Person detection breakdown
+                            if person_detections:
+                                st.subheader('👥 Person Detection Breakdown')
+                                
+                                for name, data in person_detections.items():
+                                    col1, col2, col3, col4 = st.columns(4)
+                                    
+                                    with col1:
+                                        st.write(f"**{name}**")
+                                    
+                                    with col2:
+                                        st.write(f"Role: {data['role']}")
+                                    
+                                    with col3:
+                                        st.write(f"Detections: {data['count']}")
+                                    
+                                    with col4:
+                                        st.write(f"Duration: {data['last_seen'] - data['first_seen']:.1f}s")
+                            
+                            # Detailed detections table
+                            if detections:
+                                st.subheader('📋 Detailed Detections')
+                                
+                                # Create DataFrame for display
+                                detections_df = pd.DataFrame(detections)
+                                detections_df['timestamp_formatted'] = detections_df['timestamp'].apply(
+                                    lambda x: f"{int(x//60):02d}:{int(x%60):02d}"
+                                )
+                                
+                                # Display table
+                                st.dataframe(
+                                    detections_df[['frame', 'timestamp_formatted', 'name', 'role']].rename(
+                                        columns={'timestamp_formatted': 'Time', 'name': 'Person', 'role': 'Role'}
+                                    ),
+                                    use_container_width=True,
+                                    hide_index=True
+                                )
+                                
+                                # Export functionality
+                                st.subheader('📤 Export Results')
+                                col1, col2 = st.columns(2)
+                                
+                                with col1:
+                                    csv_data = detections_df.to_csv(index=False)
+                                    st.download_button(
+                                        label="Download CSV Report",
+                                        data=csv_data,
+                                        file_name=f'video_analysis_{uploaded_file.name.split(".")[0]}.csv',
+                                        mime='text/csv'
+                                    )
+                                
+                                with col2:
+                                    # Create summary report
+                                    summary_data = {
+                                        'Metric': ['Total Frames', 'Video Duration (s)', 'Total Detections', 'Unique Persons'],
+                                        'Value': [total_frames, f"{duration:.1f}", detection_count, len(person_detections)]
+                                    }
+                                    summary_df = pd.DataFrame(summary_data)
+                                    summary_csv = summary_df.to_csv(index=False)
+                                    st.download_button(
+                                        label="Download Summary",
+                                        data=summary_csv,
+                                        file_name=f'video_summary_{uploaded_file.name.split(".")[0]}.csv',
+                                        mime='text/csv'
+                                    )
+                            
+                            # Log detections to database
+                            if detections:
+                                conn = sqlite3.connect(DB_PATH)
+                                c = conn.cursor()
+                                
+                                for detection in detections:
+                                    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                                    c.execute('INSERT INTO logs (timestamp, name, role, event) VALUES (?, ?, ?, ?)',
+                                              (timestamp, detection['name'], detection['role'], 'video_analysis'))
+                                
+                                conn.commit()
+                                conn.close()
+                                
+                                st.info("📝 Detections have been logged to the database.")
+                        
+                    except Exception as e:
+                        st.error(f"❌ Error during analysis: {str(e)}")
+                        # Clean up on error
+                        if 'temp_video_path' in locals():
+                            try:
+                                os.unlink(temp_video_path)
+                            except:
+                                pass
 
 # --- Analytics & Reports ---
 elif page == 'Analytics & Reports':
