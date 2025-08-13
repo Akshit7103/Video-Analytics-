@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(del \"C:\\Users\\akshi\\Desktop\\New folder\\7 august\\debug_sumit.py\")",
+      "Bash(rm:*)",
+      "Bash(sqlite3:*)",
+      "Bash(mkdir:*)",
+      "Bash(git remote set-url:*)",
+      "Bash(git add:*)"
+    ],
+    "deny": []
+  }
+}

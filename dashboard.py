@@ -258,6 +258,57 @@ def create_person_activity_chart(df):
     
     return fig
 
+def _process_frame_batch(batch_frames, app, known_embeddings_np, known_names, known_roles, detections, person_detections, fps):
+    """Process a batch of frames efficiently"""
+    batch_detection_count = 0
+    
+    for frame, frame_count in batch_frames:
+        # Resize frame for faster processing while maintaining face detection quality
+        height, width = frame.shape[:2]
+        if width > 800:  # Only resize if frame is large
+            scale = 800 / width
+            new_width = int(width * scale)
+            new_height = int(height * scale)
+            frame = cv2.resize(frame, (new_width, new_height))
+        
+        # Detect faces in frame
+        faces = app.get(frame)
+        
+        for face in faces:
+            embedding = face.normed_embedding
+            
+            # Vectorized distance calculation for all known embeddings at once
+            if len(known_embeddings_np) > 0:
+                dists = np.linalg.norm(known_embeddings_np - embedding, axis=1)
+                min_idx = np.argmin(dists)
+                
+                if dists[min_idx] < 0.8:
+                    name = known_names[min_idx]
+                    role = known_roles[min_idx]
+                    batch_detection_count += 1
+                    
+                    # Track detections per person
+                    if name not in person_detections:
+                        person_detections[name] = {
+                            'count': 0,
+                            'role': role,
+                            'first_seen': frame_count / fps,
+                            'last_seen': frame_count / fps
+                        }
+                    
+                    person_detections[name]['count'] += 1
+                    person_detections[name]['last_seen'] = frame_count / fps
+                    
+                    # Add to detections list
+                    detections.append({
+                        'frame': frame_count,
+                        'timestamp': frame_count / fps,
+                        'name': name,
+                        'role': role
+                    })
+    
+    return batch_detection_count
+
 # --- Sidebar Navigation ---
 page = st.sidebar.radio('Go to', ['Register Face', 'Edit Faces', 'Real-Time Recognition', 'Video Upload & Analysis', 'Analytics & Reports', 'View Logs & Faces'])
 
@@ -674,6 +725,13 @@ elif page == 'Video Upload & Analysis':
         if file_size > 200:
             st.error("❌ File size exceeds 200MB limit. Please upload a smaller file.")
         else:
+            # Analysis options
+            col1, col2 = st.columns(2)
+            with col1:
+                max_detections = st.number_input('Stop after X detections (0 = no limit)', min_value=0, value=0)
+            with col2:
+                max_duration = st.number_input('Max analysis time (minutes, 0 = no limit)', min_value=0, value=5)
+            
             # Analysis button
             if st.button('🔍 Start Video Analysis', type='primary'):
                 with st.spinner('🔄 Analyzing video... This may take a while depending on video length.'):
@@ -698,9 +756,9 @@ elif page == 'Video Upload & Analysis':
                                     known_roles.append(role)
                                     known_embeddings.append(embedding)
                         
-                        # Initialize face analysis
+                        # Initialize face analysis with optimized settings for video
                         app = FaceAnalysis()
-                        app.prepare(ctx_id=0, det_size=(640, 640))
+                        app.prepare(ctx_id=0, det_size=(224, 224))  # Smaller detection size for speed
                         
                         # Open video file
                         cap = cv2.VideoCapture(temp_video_path)
@@ -718,60 +776,63 @@ elif page == 'Video Upload & Analysis':
                             detections = []
                             person_detections = {}
                             
+                            # Optimized batch processing
+                            batch_frames = []
+                            batch_size = 32  # Process frames in batches
+                            frame_skip = min(max(int(fps / 2), 10), 30)  # Dynamic frame sampling
+                            
                             # Progress bar
                             progress_bar = st.progress(0)
                             status_text = st.empty()
+                            
+                            # Convert known_embeddings to numpy array for vectorized operations
+                            known_embeddings_np = np.array(known_embeddings) if known_embeddings else np.array([])
+                            
+                            # Early stopping variables
+                            analysis_start_time = time.time()
+                            max_duration_seconds = max_duration * 60 if max_duration > 0 else float('inf')
                             
                             # Process video frames
                             while True:
                                 ret, frame = cap.read()
                                 if not ret:
+                                    # Process remaining batch
+                                    if batch_frames:
+                                        detection_count += _process_frame_batch(batch_frames, app, known_embeddings_np, known_names, known_roles,
+                                                                detections, person_detections, fps)
                                     break
                                 
                                 frame_count += 1
                                 
-                                # Update progress
-                                if total_frames > 0:
+                                # Early stopping checks
+                                if max_detections > 0 and len(detections) >= max_detections:
+                                    status_text.text(f"🛑 Stopped: Reached {max_detections} detections limit")
+                                    break
+                                
+                                if time.time() - analysis_start_time > max_duration_seconds:
+                                    status_text.text(f"🛑 Stopped: Reached {max_duration} minute time limit")
+                                    break
+                                
+                                # Update progress every 50 frames for better responsiveness
+                                if frame_count % 50 == 0 and total_frames > 0:
                                     progress = frame_count / total_frames
                                     progress_bar.progress(progress)
-                                    status_text.text(f"Processing frame {frame_count}/{total_frames} ({progress*100:.1f}%)")
+                                    elapsed_time = (time.time() - analysis_start_time) / 60
+                                    status_text.text(f"Processing frame {frame_count}/{total_frames} ({progress*100:.1f}%) - {len(detections)} detections - {elapsed_time:.1f}min elapsed")
                                 
-                                # Process every 5th frame for efficiency
-                                if frame_count % 5 != 0:
+                                # Dynamic frame sampling
+                                if frame_count % frame_skip != 0:
                                     continue
                                 
-                                # Detect faces in frame
-                                faces = app.get(frame)
+                                # Add frame to batch
+                                batch_frames.append((frame, frame_count))
                                 
-                                for face in faces:
-                                    embedding = face.normed_embedding
-                                    dists = np.linalg.norm(np.array(known_embeddings) - embedding, axis=1)
-                                    min_idx = np.argmin(dists) if len(dists) > 0 else -1
-                                    
-                                    if len(dists) > 0 and dists[min_idx] < 0.8:
-                                        name = known_names[min_idx]
-                                        role = known_roles[min_idx]
-                                        detection_count += 1
-                                        
-                                        # Track detections per person
-                                        if name not in person_detections:
-                                            person_detections[name] = {
-                                                'count': 0,
-                                                'role': role,
-                                                'first_seen': frame_count / fps,
-                                                'last_seen': frame_count / fps
-                                            }
-                                        
-                                        person_detections[name]['count'] += 1
-                                        person_detections[name]['last_seen'] = frame_count / fps
-                                        
-                                        # Add to detections list
-                                        detections.append({
-                                            'frame': frame_count,
-                                            'timestamp': frame_count / fps,
-                                            'name': name,
-                                            'role': role
-                                        })
+                                # Process batch when full
+                                if len(batch_frames) >= batch_size:
+                                    detection_count += _process_frame_batch(batch_frames, app, known_embeddings_np, 
+                                                                               known_names, known_roles, detections, 
+                                                                               person_detections, fps)
+                                    batch_frames = []
                             
                             cap.release()
                         
